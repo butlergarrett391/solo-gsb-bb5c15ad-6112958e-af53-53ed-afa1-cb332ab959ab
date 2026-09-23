@@ -75,6 +75,58 @@ class DuplicatesResponse(BaseModel):
     records: List[DuplicateRecord]
 
 
+# ---------------------------------------------------------------------------
+# 缺包作废
+# ---------------------------------------------------------------------------
+
+class VoidCreate(BaseModel):
+    """作废一段确认丢失的连续序号（从 next_expected 开始的缺口）。"""
+
+    from_seq: int = Field(
+        ge=1, description="作废段起点（含），必须等于当前 next_expected"
+    )
+    to_seq: int = Field(
+        ge=1, description="作废段终点（含），不得超过当前缓冲区最大序号"
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None, description="幂等键；也可用 Idempotency-Key 请求头传入"
+    )
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.from_seq > self.to_seq:
+            raise ValueError("from_seq 不能大于 to_seq")
+        return self
+
+
+class VoidResponse(BaseModel):
+    status: Literal["voided", "duplicate"]
+    device_id: str
+    from_seq: int
+    to_seq: int
+    committed_upto: int
+    committed_seqs: List[int] = Field(
+        default_factory=list,
+        description="本次作废触发排水提交的真实包序号（不含作废段）",
+    )
+    duplicate_reason: Optional[str] = None
+
+
+class VoidRecord(BaseModel):
+    id: int
+    device_id: str
+    from_seq: int
+    to_seq: int
+    idempotency_key: Optional[str]
+    created_at: str
+
+
+class VoidsResponse(BaseModel):
+    device_id: str
+    count: int
+    records: List[VoidRecord]
+
+
 class RollupWindow(BaseModel):
     """单个半开窗口 [start, end) 的聚合结果；空窗口 count=0 且统计值为 null。"""
 

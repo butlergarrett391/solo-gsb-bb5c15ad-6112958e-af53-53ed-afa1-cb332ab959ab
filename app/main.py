@@ -26,6 +26,7 @@ from . import exports
 from .exports import ExportError, InvalidCursor
 from .logic import IdempotencyConflict, ingest_package
 from .rollup import RollupError, compute_rollup
+from .voids import VoidError, void_range
 from .schemas import (
     AlertEventsResponse,
     AlertEventOut,
@@ -51,6 +52,10 @@ from .schemas import (
     RuleListResponse,
     RuleOut,
     RuleUpdate,
+    VoidCreate,
+    VoidRecord,
+    VoidResponse,
+    VoidsResponse,
 )
 
 
@@ -62,8 +67,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Instrument Ingest API",
-    version="1.0.0",
-    description="实验室仪器批量测量包接收服务：幂等去重、乱序缓冲、按序提交。",
+    version="1.1.0",
+    description="实验室仪器批量测量包接收服务：幂等去重、乱序缓冲、按序提交、缺包作废。",
     lifespan=lifespan,
 )
 
@@ -212,6 +217,69 @@ def get_duplicates(
         device_id=device_id,
         count=total,
         records=[DuplicateRecord(**dict(r)) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 缺包作废
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/devices/{device_id}/voids", response_model=VoidResponse, status_code=200)
+def post_void(
+    device_id: str,
+    void_in: VoidCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    """作废从 next_expected 开始的连续缺口段，推进顺序前沿并排水随后缓冲包。
+
+    与摄入共用串行锁与事务；携带幂等键可安全重试（重放返回首次结果）。
+    """
+    key = void_in.idempotency_key or idempotency_key
+    if not key:
+        raise HTTPException(
+            status_code=422,
+            detail="缺少幂等键：请在请求体 idempotency_key 或 Idempotency-Key 请求头中提供",
+        )
+    with db.ingest_lock, db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        try:
+            return void_range(
+                conn, device_id, void_in.from_seq, void_in.to_seq, key
+            )
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except VoidError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/devices/{device_id}/voids", response_model=VoidsResponse)
+def get_voids(
+    device_id: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    """按设备分页查询作废记录，按登记顺序（id）升序返回。"""
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM voids WHERE device_id = ?", (device_id,)
+        ).fetchone()["n"]
+        rows = conn.execute(
+            "SELECT * FROM voids WHERE device_id = ? ORDER BY id LIMIT ? OFFSET ?",
+            (device_id, limit, offset),
+        ).fetchall()
+    return VoidsResponse(
+        device_id=device_id,
+        count=total,
+        records=[VoidRecord(**dict(r)) for r in rows],
     )
 
 

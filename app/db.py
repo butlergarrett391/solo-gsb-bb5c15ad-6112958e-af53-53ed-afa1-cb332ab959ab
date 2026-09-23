@@ -57,6 +57,20 @@ CREATE TABLE IF NOT EXISTS duplicates (
 
 CREATE INDEX IF NOT EXISTS idx_duplicates_device ON duplicates (device_id, id);
 
+-- 缺包作废登记：确认丢失、从 next_expected 开始的连续序号段。
+-- 作废段不产生 committed 行，仅推进设备顺序前沿（committed_upto 越过作废段），
+-- 因此 committed 表的 seq 不再保证无空洞；迟到补交的作废序号包按 already_committed 去重。
+CREATE TABLE IF NOT EXISTS voids (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id       TEXT NOT NULL,
+    from_seq        INTEGER NOT NULL,         -- 作废段起点（含），登记时等于 next_expected
+    to_seq          INTEGER NOT NULL,         -- 作废段终点（含），不超过登记时缓冲区最大序号
+    idempotency_key TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_voids_device ON voids (device_id, id);
+
 -- 持久化阈值告警规则：按 (设备, 指标) 唯一，上下限至少配置一个
 CREATE TABLE IF NOT EXISTS alert_rules (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -5,12 +5,15 @@
 - 设备首个到达的包用于自举：committed_upto 初始化为 seq - 1，即首包立即提交；
 - 之后到达的包：seq <= committed_upto 视为重复；已在缓冲区视为重复；
 - 否则放入缓冲区，随后从 committed_upto + 1 起连续"排水"提交。
+
+committed_upto 也可由缺包作废推进（见 voids.py）：作废段被前沿永久越过，
+不再期望到达，其迟到补交按 already_committed 去重。
 """
 
 import hashlib
 import json
 import sqlite3
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from . import alerts
 from .schemas import IngestResponse, PackageIn
@@ -62,6 +65,37 @@ def _store_key(
         " VALUES (?,?,?,?,?)",
         (key, pkg.device_id, pkg.seq, payload_hash, response.model_dump_json()),
     )
+
+
+def drain_buffer(
+    conn: sqlite3.Connection, device_id: str, start: int
+) -> Tuple[List[int], List[tuple], int]:
+    """从 start 起连续"排水"提交缓冲包，返回 (committed_seqs, committed_payloads, 新前沿)。
+
+    committed_payloads 为按提交顺序排列的 (seq, payload_json)，供告警评估回放；
+    摄入与缺包作废共用本函数，保证两条路径的排水行为完全一致。
+    """
+    committed_seqs: List[int] = []
+    committed_payloads: List[tuple] = []
+    cur = start
+    while True:
+        row = conn.execute(
+            "SELECT payload_json FROM buffer WHERE device_id = ? AND seq = ?",
+            (device_id, cur),
+        ).fetchone()
+        if row is None:
+            break
+        conn.execute(
+            "INSERT INTO committed (device_id, seq, payload_json) VALUES (?,?,?)",
+            (device_id, cur, row["payload_json"]),
+        )
+        conn.execute(
+            "DELETE FROM buffer WHERE device_id = ? AND seq = ?", (device_id, cur)
+        )
+        committed_seqs.append(cur)
+        committed_payloads.append((cur, row["payload_json"]))
+        cur += 1
+    return committed_seqs, committed_payloads, cur - 1
 
 
 def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> IngestResponse:
@@ -126,28 +160,9 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
         (pkg.device_id, pkg.seq, payload_json),
     )
 
-    committed_seqs = []
-    committed_payloads = []
-    cur = committed_upto + 1
-    while True:
-        row = conn.execute(
-            "SELECT payload_json FROM buffer WHERE device_id = ? AND seq = ?",
-            (pkg.device_id, cur),
-        ).fetchone()
-        if row is None:
-            break
-        conn.execute(
-            "INSERT INTO committed (device_id, seq, payload_json) VALUES (?,?,?)",
-            (pkg.device_id, cur, row["payload_json"]),
-        )
-        conn.execute(
-            "DELETE FROM buffer WHERE device_id = ? AND seq = ?", (pkg.device_id, cur)
-        )
-        committed_seqs.append(cur)
-        committed_payloads.append((cur, row["payload_json"]))
-        cur += 1
-
-    committed_upto = cur - 1
+    committed_seqs, committed_payloads, committed_upto = drain_buffer(
+        conn, pkg.device_id, committed_upto + 1
+    )
     conn.execute(
         "UPDATE devices SET committed_upto = ? WHERE device_id = ?",
         (committed_upto, pkg.device_id),

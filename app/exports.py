@@ -187,11 +187,12 @@ def create_export(
         last_seq = row["seq"]
         items.append((export_id, idx, row["seq"], chunk))
 
-    # 请求范围是否被已提交数据连续完整覆盖。committed 表中的 seq 必然连续
-    # （首包自举 + 按序排水），因此完整的充要条件是：
+    # 请求范围是否被已提交数据连续完整覆盖。缺包作废会在 committed 序号中留下
+    # 空洞（作废段永不产生 committed 行），因此完整的充要条件是：
     #   1) 请求下界（缺省取快照首序号）等于快照首序号——下界已提交且无前置缺口；
     #   2) 请求上界（缺省取设备已提交边界）等于快照末序号——上界未越过已提交边界；
-    #   3) 无界上界时缓冲区中不得还有待提交包（缺口中的包未纳入快照）。
+    #   3) 无界上界时缓冲区中不得还有待提交包（缺口中的包未纳入快照）；
+    #   4) 快照包数等于范围长度——范围内不存在作废或缺失的序号空洞。
     dev_row = conn.execute(
         "SELECT committed_upto FROM devices WHERE device_id = ?", (device_id,)
     ).fetchone()
@@ -210,6 +211,7 @@ def create_export(
         and want_lo == first_seq
         and want_hi == last_seq
         and buffered_beyond == 0
+        and len(rows) == want_hi - want_lo + 1
     )
 
     # 先写父表 export_tasks，再写快照行（外键约束）
