@@ -38,11 +38,14 @@ class IngestResponse(BaseModel):
 
 class DeviceState(BaseModel):
     device_id: str
-    committed_upto: int
+    committed_upto: int = Field(
+        description="已连续处理（提交或作废）的最大序号"
+    )
     next_expected: int
     buffered_count: int
     committed_count: int
     duplicate_count: int
+    voided_count: int = Field(description="已作废序号总数（缺包作废段长度之和）")
 
 
 class GapsResponse(BaseModel):
@@ -73,6 +76,67 @@ class DuplicatesResponse(BaseModel):
     device_id: str
     count: int
     records: List[DuplicateRecord]
+
+
+# ---------------------------------------------------------------------------
+# 缺包作废
+# ---------------------------------------------------------------------------
+
+class VoidCreate(BaseModel):
+    """对一段确定缺失的连续序号发起作废。"""
+
+    from_seq: int = Field(
+        ge=1, description="作废段起点（含）；必须恰好等于当前 next_expected"
+    )
+    to_seq: int = Field(
+        ge=1, description="作废段终点（含）；不得超过当前缓冲区最大序号"
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None, description="幂等键；也可用 Idempotency-Key 请求头传入"
+    )
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.from_seq > self.to_seq:
+            raise ValueError("from_seq 不能大于 to_seq")
+        return self
+
+
+class VoidResponse(BaseModel):
+    status: Literal["voided"]
+    device_id: str
+    from_seq: int = Field(description="作废段起点（含）")
+    to_seq: int = Field(description="作废段终点（含）")
+    voided_seqs: List[int] = Field(description="本次登记作废的全部序号")
+    committed_upto: int = Field(
+        description="作废并排水后已连续处理（提交或作废）的最大序号"
+    )
+    committed_seqs: List[int] = Field(
+        default_factory=list,
+        description="作废后立即排水提交的真实缓冲包序号（不含作废序号）",
+    )
+
+
+class VoidRecordOut(BaseModel):
+    """一条作废登记：一段连续的作废序号。"""
+
+    id: int
+    device_id: str
+    from_seq: int = Field(description="作废段起点（含）")
+    to_seq: int = Field(description="作废段终点（含）")
+    voided_seqs: List[int] = Field(description="该段作废的全部序号")
+    created_at: str
+
+
+class VoidsResponse(BaseModel):
+    device_id: str
+    committed_upto: int = Field(
+        description="已连续处理（提交或作废）的最大序号"
+    )
+    next_expected: int
+    count: int = Field(description="作废登记段数")
+    voided_count: int = Field(description="已作废序号总数")
+    records: List[VoidRecordOut]
 
 
 class RollupWindow(BaseModel):

@@ -4,7 +4,8 @@
 
 - **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据或重复告警事件；
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**（告警也按该提交顺序评估）；
-- **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
+- **缺包作废**：确定丢失的连续序号段可登记作废以推进顺序前沿（段必须从 `next_expected` 开始、段内确为缺口、段尾不超过缓冲区最大序号），作废后立即排水提交随后连续的缓冲包；作废序号**不是测量包**，不进入已提交数据、不参与告警；
+- **可观测接口**：查询每台设备的缺口、已提交序号、重复包记录与作废登记；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
 - **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量；窗口聚合支持可选的校准值模式（`calibrated=true`），按每个已提交包的 `sent_at` 解析当时生效的校准区间计算统计值，无配置沿用原始值。
@@ -54,22 +55,26 @@ pytest tests/
 }
 ```
 
-- `seq`：包序号，**按设备**从 1 起单调递增、连续；
+- `seq`：包序号，**按设备**从 1 起单调递增；正常情况下连续，确认丢失的序号可通过缺包作废登记为永久缺口（见「缺包作废」）；
 - `idempotency_key`：幂等键（也可通过 `Idempotency-Key` 请求头传入，二者至少提供一个）。
 
 ## 提交规则
 
-每台设备独立维护 `committed_upto`（已连续提交的最大序号）：
+每台设备独立维护 `committed_upto`（已连续**处理**的最大序号，处理 = 真实提交或缺包作废）：
 
 1. **首包自举**：设备第一个到达的包立即提交，`committed_upto` 初始化为 `seq - 1`；
 2. 之后到达的包：
-   - `seq <= committed_upto` → 重复（`already_committed`）；
+   - `seq <= committed_upto` → 重复；已提交序号为 `already_committed`，已作废序号（缺包迟到）为 `already_voided`；
    - 已在缓冲区 → 重复（`already_buffered`）；
-   - 否则放入缓冲区，并从 `committed_upto + 1` 起连续"排水"提交；
+   - 否则放入缓冲区，并从 `committed_upto + 1` 起连续"排水"：缓冲中存在的包按序提交，已登记作废的序号直接跨过（不写入 committed），直到遇到下一个新缺口；
 3. 同一幂等键重放 → 返回首次处理结果（`idempotent_replay`）；
 4. 同一幂等键携带**不同载荷** → `409 Conflict`。
 
-所有摄入操作在单事务内完成，保证并发下状态一致。
+> 注意：作废后已提交序号集合**不再连续**（作废序号永久缺席），但顺序前沿
+> `committed_upto` 仍单调推进、排水与告警严格按序号顺序进行。
+
+所有摄入 / 作废操作共用同一把进程级串行锁（`ingest_lock`）并各自在单事务内
+完成，保证并发下状态一致。
 
 ## API 一览
 
@@ -79,8 +84,10 @@ pytest tests/
 | POST | `/api/v1/packages` | 上报测量包（幂等、乱序缓冲、按序提交） |
 | GET | `/api/v1/devices` | 设备列表及状态汇总 |
 | GET | `/api/v1/devices/{id}/gaps` | 缺口：缓冲区序号与缺失序号 |
-| GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`） |
-| GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤） |
+| GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`；作废序号不在其中） |
+| GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤，含 `already_voided`） |
+| POST | `/api/v1/devices/{id}/voids` | 登记缺包作废段（幂等；推进前沿并立即排水提交后续缓冲包） |
+| GET | `/api/v1/devices/{id}/voids` | 按设备分页查询作废登记 |
 | GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计，可选 `calibrated=true` 校准值口径） |
 | POST | `/api/v1/rules` | 创建阈值告警规则（按 设备+指标 唯一） |
 | GET | `/api/v1/rules` | 规则列表（可按 `device_id`/`metric` 过滤） |
@@ -220,6 +227,82 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 #        "event_type":"recovered","value":27.0,"event_time":"2026-09-22T08:00:08Z","created_at":"..."}]}
 ```
 
+## 缺包作废（Voids）
+
+某些缺口序号经确认永远不会到达（丢包 / 设备跳过），可以把一段**连续缺口**
+登记作废，让顺序前沿越过它们继续前进。作废与摄入共用串行锁与数据库事务。
+
+### 允许作废的条件（全部满足，任一不满足返回 `409`）
+
+- 设备**必须已存在**（至少接收过一个包）；未知设备返回 `404`；
+- 起点 `from_seq` 必须**恰好等于当前 `next_expected`**（= `committed_upto + 1`），
+  不能跳过未处理序号，也不能作废已处理区间；
+- 段内 `[from_seq, to_seq]` 每个序号当前都**确为缺口**：
+  已提交、已缓冲、已作废的序号都不得作废；
+- 段尾 `to_seq` **不得超过当前缓冲区最大序号**——缓冲区之外没有已知边界，
+  无缓冲时不存在可作废的缺口。
+
+作废处理（同一事务内）：
+
+1. 在 `void_records` 登记作废段（只登记"缺席"事实，**不构造任何测量包**）；
+2. 推进顺序前沿并立即排水：作废序号被跨过，其后连续的缓冲包按序提交到
+   `committed`，`committed_upto` 更新为"提交 / 作废"连续覆盖到的最大序号；
+3. 排水沿用现有告警评估：只有真实提交的缓冲包进入告警状态机，
+   **作废序号绝不被伪装成测量包**，不产生任何告警事件。
+
+作废之后迟到的原包按重复处理（`already_voided`），不会复活、不会写入 committed。
+
+### 登记作废
+
+`POST /api/v1/devices/{device_id}/voids`
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `from_seq` | 是 | 作废段起点（含），必须等于当前 `next_expected`，`>= 1` |
+| `to_seq` | 是 | 作废段终点（含），不得小于 `from_seq`，不得超过缓冲区最大序号 |
+| `idempotency_key` | 否 | 幂等键；也可用 `Idempotency-Key` 请求头传入，二者至少提供一个 |
+
+```bash
+# 已提交 1；2、3 确认丢失；4、5 已在缓冲区等待
+curl -X POST localhost:8000/api/v1/devices/ph-meter-01/voids \
+  -H 'Content-Type: application/json' \
+  -d '{"from_seq": 2, "to_seq": 3, "idempotency_key": "void-ph-meter-01-2-3"}'
+# => 200
+# {"status":"voided","device_id":"ph-meter-01","from_seq":2,"to_seq":3,
+#  "voided_seqs":[2,3],"committed_upto":5,"committed_seqs":[4,5]}
+```
+
+- `committed_seqs`：作废后**立即排水提交的真实缓冲包**（不含作废序号）；
+- 同一作废请求（同幂等键同载荷）重试：原样返回首次结果，**不重复登记、
+  不重复推进、不重复排水**；
+- 同幂等键携带不同载荷，或请求与当前状态冲突（起点不是 `next_expected`、
+  段内含缓冲包、段尾越过缓冲边界等）→ `409 Conflict`，`detail` 给出具体原因；
+- `from_seq > to_seq`、序号小于 1、缺少幂等键 → `422`。
+
+### 查询作废记录
+
+`GET /api/v1/devices/{device_id}/voids`（`limit` 默认 100、最大 1000，`offset` 分页，
+按登记先后升序）：
+
+```bash
+curl localhost:8000/api/v1/devices/ph-meter-01/voids
+# => {"device_id":"ph-meter-01","committed_upto":5,"next_expected":6,
+#     "count":1,"voided_count":2,
+#     "records":[{"id":1,"device_id":"ph-meter-01","from_seq":2,"to_seq":3,
+#                 "voided_seqs":[2,3],"created_at":"..."}]}
+```
+
+`GET /api/v1/devices` 的每个设备状态另含 `voided_count`（已作废序号总数）。
+
+### 序号语义与导出
+
+- 作废序号在**已提交数据中永久缺席**：`committed` 表与
+  `/devices/{id}/committed` 只含真实包，因此作废之后已提交序号可能不连续，
+  而 `committed_upto` / `next_expected` 仍单调推进；
+- 归档导出（见下文）**只包含真实已提交包**；当请求范围与任何作废段相交时，
+  manifest 的 `complete=false`（无法保证范围被真实数据连续覆盖），
+  但导出内容与 `content_sha256` 仍只对应真实包，作废序号不会出现在 NDJSON 中。
+
 ## 设备指标校准（Calibrations）
 
 按 **设备 + 指标** 维护线性校准配置：`校准值 = 原始值 × scale + offset`。
@@ -345,7 +428,8 @@ Manifest 字段：
 
 - `package_count`：快照包数；`first_seq` / `last_seq`：快照首尾序号（空导出为 `null`）；
 - `complete`：请求范围是否被创建时刻的已提交数据**连续完整覆盖**——
-  范围越出已提交边界、范围内仍有缺口（缓冲未排水）时为 `false`，提示调用方快照只是部分内容；
+  范围越出已提交边界、范围内仍有缺口（缓冲未排水）、或范围与任何**缺包作废段**
+  相交时为 `false`，提示调用方快照只是部分内容（作废序号永久缺席，不在导出中）；
 - `content_sha256`：全量导出内容（按 seq 升序逐行 NDJSON、UTF-8）的 SHA-256。
 
 ### NDJSON 分页与游标续传
@@ -426,21 +510,37 @@ curl localhost:8000/api/v1/devices/ph-meter-01/committed    # 已提交序号
 curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 ```
 
+缺包作废（详见「缺包作废」一节）：
+
+```bash
+# 1 已提交；2、3 确认丢失；4 已缓冲
+curl -X POST localhost:8000/api/v1/devices/ph-meter-01/voids \
+  -H 'Content-Type: application/json' \
+  -d '{"from_seq":2,"to_seq":3,"idempotency_key":"void-0012"}'
+# => {"status":"voided","voided_seqs":[2,3],"committed_upto":4,"committed_seqs":[4]}
+
+# committed 只有真实包：1、4（作废序号 2、3 永久缺席）
+curl localhost:8000/api/v1/devices/ph-meter-01/committed
+# 范围含作废序号的导出 complete=false，NDJSON 仍只有真实包
+```
+
 ## 项目结构
 
 ```
 app/
   main.py         # FastAPI 路由
-  logic.py        # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
+  logic.py        # 摄入核心：幂等判定、缓冲、排水提交（摄入与作废共用的排水路径，提交时驱动告警评估）
+  voids.py        # 缺包作废：缺口段校验、登记推进、共用排水、幂等与登记查询
   alerts.py       # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
   calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算（含区间索引供聚合批量解析）
   rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径
-  exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验
+  exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验（范围含作废段时 complete=false）
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型
 tests/
   conftest.py           # 测试数据库隔离（临时文件）
   test_api.py           # 摄入 / 查询接口测试
+  test_voids.py         # 缺包作废：约束 / 排水 / 共用排水告警 / 幂等 / 冲突 / 导出完整性测试
   test_rollup.py        # 窗口聚合测试
   test_alerts.py        # 阈值告警测试
   test_calibrations.py  # 校准配置 / 解析 / 原始数据不变测试

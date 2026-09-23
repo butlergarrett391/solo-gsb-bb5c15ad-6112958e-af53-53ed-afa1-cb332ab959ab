@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from .voids import range_has_void
+
 
 class ExportError(ValueError):
     """导出参数非法（范围非法、页大小非法等）。"""
@@ -187,11 +189,10 @@ def create_export(
         last_seq = row["seq"]
         items.append((export_id, idx, row["seq"], chunk))
 
-    # 请求范围是否被已提交数据连续完整覆盖。committed 表中的 seq 必然连续
-    # （首包自举 + 按序排水），因此完整的充要条件是：
-    #   1) 请求下界（缺省取快照首序号）等于快照首序号——下界已提交且无前置缺口；
-    #   2) 请求上界（缺省取设备已提交边界）等于快照末序号——上界未越过已提交边界；
-    #   3) 无界上界时缓冲区中不得还有待提交包（缺口中的包未纳入快照）。
+    # 请求范围是否被已提交数据连续完整覆盖。作废序号不是真实测量包，
+    # 因此除"范围与 committed 完全重合且无未排水缓冲"外，还要求范围内
+    # 不含任何作废段（committed 在作废之后仍按 seq 连续存储，无法仅靠
+    # committed 自身发现缺口，必须显式排查 void_records）。
     dev_row = conn.execute(
         "SELECT committed_upto FROM devices WHERE device_id = ?", (device_id,)
     ).fetchone()
@@ -204,12 +205,20 @@ def create_export(
             "SELECT COUNT(*) AS n FROM buffer WHERE device_id = ? AND seq > ?",
             (device_id, committed_upto),
         ).fetchone()["n"]
+    range_lo = from_seq if from_seq is not None else first_seq
+    range_hi = to_seq if to_seq is not None else last_seq
+    void_in_range = (
+        range_has_void(conn, device_id, range_lo, range_hi)
+        if range_lo is not None and range_hi is not None
+        else False
+    )
     complete = (
         len(rows) > 0
         and want_lo is not None
         and want_lo == first_seq
         and want_hi == last_seq
         and buffered_beyond == 0
+        and not void_in_range
     )
 
     # 先写父表 export_tasks，再写快照行（外键约束）

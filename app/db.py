@@ -17,7 +17,7 @@ ingest_lock = threading.Lock()
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     device_id      TEXT PRIMARY KEY,
-    committed_upto INTEGER NOT NULL,          -- 已连续提交到的最大序号
+    committed_upto INTEGER NOT NULL,          -- 已连续处理（提交或作废）的最大序号
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS duplicates (
     device_id       TEXT NOT NULL,
     seq             INTEGER,
     idempotency_key TEXT,
-    reason          TEXT NOT NULL,            -- idempotent_replay / already_committed / already_buffered
+    reason          TEXT NOT NULL,            -- idempotent_replay / already_committed / already_buffered / already_voided
     received_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -145,6 +145,33 @@ CREATE TABLE IF NOT EXISTS calibrations (
 
 CREATE INDEX IF NOT EXISTS idx_calibrations_device_metric
     ON calibrations (device_id, metric, valid_from);
+
+-- 缺包作废登记：每行一个作废的连续序号段 [from_seq, to_seq]。
+-- 作废段一经登记即推进设备的顺序前沿（committed_upto），作废序号
+-- 永远不会进入 committed，也不参与告警评估。(设备, from, to) 唯一，
+-- 作为"同段重复登记"的最终防线（正常重试由幂等表短路）。
+CREATE TABLE IF NOT EXISTS void_records (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    from_seq    INTEGER NOT NULL,              -- 作废段起点（含），登记时恰为 next_expected
+    to_seq      INTEGER NOT NULL,              -- 作废段终点（含），不超过当时缓冲区最大序号
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (device_id, from_seq, to_seq),
+    CHECK (from_seq >= 1 AND to_seq >= from_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_void_records_device ON void_records (device_id, id);
+
+-- 作废请求的幂等键：与摄入幂等表结构对应但独立存放，重放不产生重复登记。
+CREATE TABLE IF NOT EXISTS void_idempotency_keys (
+    key           TEXT PRIMARY KEY,
+    device_id     TEXT NOT NULL,
+    from_seq      INTEGER NOT NULL,
+    to_seq        INTEGER NOT NULL,
+    payload_hash  TEXT NOT NULL,
+    response_json TEXT NOT NULL,               -- 首次处理结果，重放时原样返回
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 """
 
 

@@ -1,10 +1,13 @@
 """核心摄入逻辑：幂等去重、乱序缓冲、缺口补齐后按序提交。
 
 提交规则（按设备独立维护）：
-- 每台设备记录 committed_upto = 已连续提交的最大序号；
+- 每台设备记录 committed_upto = 已连续处理（提交或作废）的最大序号；
 - 设备首个到达的包用于自举：committed_upto 初始化为 seq - 1，即首包立即提交；
-- 之后到达的包：seq <= committed_upto 视为重复；已在缓冲区视为重复；
-- 否则放入缓冲区，随后从 committed_upto + 1 起连续"排水"提交。
+- 之后到达的包：seq <= committed_upto 视为重复（已提交 / 已作废）；
+  已在缓冲区视为重复；
+- 否则放入缓冲区，随后从 committed_upto + 1 起连续"排水"：
+  缓冲中存在的包按序提交，已登记作废的序号直接跨过，直到遇到新缺口；
+  作废登记（见 voids.py）与摄入共用本排水路径。
 """
 
 import hashlib
@@ -64,6 +67,45 @@ def _store_key(
     )
 
 
+def _is_voided(conn: sqlite3.Connection, device_id: str, seq: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM void_records WHERE device_id = ? AND from_seq <= ? AND to_seq >= ?",
+        (device_id, seq, seq),
+    ).fetchone() is not None
+
+
+def drain_committed(conn: sqlite3.Connection, device_id: str, committed_upto: int) -> tuple:
+    """从 committed_upto + 1 起按序推进顺序前沿（调用方持 ingest_lock）。
+
+    缓冲区中存在的包移入 committed（返回其 payload，供告警评估）；已登记
+    作废的序号不是测量包，直接跨过；直到遇到既未缓冲也未作废的缺口停止。
+    返回 (新的 committed_upto, [(seq, payload_json), ...])。
+    摄入排水与作废排水共用本函数，保证两条路径语义一致。
+    """
+    committed_payloads = []
+    cur = committed_upto + 1
+    while True:
+        row = conn.execute(
+            "SELECT payload_json FROM buffer WHERE device_id = ? AND seq = ?",
+            (device_id, cur),
+        ).fetchone()
+        if row is None:
+            if _is_voided(conn, device_id, cur):
+                cur += 1  # 作废序号不是测量包：跨过但不提交
+                continue
+            break
+        conn.execute(
+            "INSERT INTO committed (device_id, seq, payload_json) VALUES (?,?,?)",
+            (device_id, cur, row["payload_json"]),
+        )
+        conn.execute(
+            "DELETE FROM buffer WHERE device_id = ? AND seq = ?", (device_id, cur)
+        )
+        committed_payloads.append((cur, row["payload_json"]))
+        cur += 1
+    return cur - 1, committed_payloads
+
+
 def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> IngestResponse:
     """在单个事务内完成一次摄入。调用方需持有 ingest_lock。"""
     payload_hash = _payload_hash(pkg)
@@ -97,7 +139,11 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
     # 3) 重复包判定
     duplicate_reason: Optional[str] = None
     if pkg.seq <= committed_upto:
-        duplicate_reason = "already_committed"
+        # 已越过顺序前沿：可能是已提交包，也可能是已作废序号（缺包迟到）
+        duplicate_reason = (
+            "already_voided" if _is_voided(conn, pkg.device_id, pkg.seq)
+            else "already_committed"
+        )
     else:
         in_buffer = conn.execute(
             "SELECT 1 FROM buffer WHERE device_id = ? AND seq = ?",
@@ -119,35 +165,17 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
         _store_key(conn, key, pkg, payload_hash, response)
         return response
 
-    # 4) 入缓冲区，随后从下一个期望序号起连续排水提交
+    # 4) 入缓冲区，随后从下一个期望序号起连续排水提交（作废序号自动跨过）
     payload_json = _canonical_payload(pkg)
     conn.execute(
         "INSERT INTO buffer (device_id, seq, payload_json) VALUES (?,?,?)",
         (pkg.device_id, pkg.seq, payload_json),
     )
 
-    committed_seqs = []
-    committed_payloads = []
-    cur = committed_upto + 1
-    while True:
-        row = conn.execute(
-            "SELECT payload_json FROM buffer WHERE device_id = ? AND seq = ?",
-            (pkg.device_id, cur),
-        ).fetchone()
-        if row is None:
-            break
-        conn.execute(
-            "INSERT INTO committed (device_id, seq, payload_json) VALUES (?,?,?)",
-            (pkg.device_id, cur, row["payload_json"]),
-        )
-        conn.execute(
-            "DELETE FROM buffer WHERE device_id = ? AND seq = ?", (pkg.device_id, cur)
-        )
-        committed_seqs.append(cur)
-        committed_payloads.append((cur, row["payload_json"]))
-        cur += 1
-
-    committed_upto = cur - 1
+    committed_upto, committed_payloads = drain_committed(
+        conn, pkg.device_id, committed_upto
+    )
+    committed_seqs = [s for s, _ in committed_payloads]
     conn.execute(
         "UPDATE devices SET committed_upto = ? WHERE device_id = ?",
         (committed_upto, pkg.device_id),

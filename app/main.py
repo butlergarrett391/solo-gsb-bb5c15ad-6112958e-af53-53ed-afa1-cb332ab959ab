@@ -51,6 +51,17 @@ from .schemas import (
     RuleListResponse,
     RuleOut,
     RuleUpdate,
+    VoidCreate,
+    VoidRecordOut,
+    VoidResponse,
+    VoidsResponse,
+)
+from .voids import (
+    VoidConflict,
+    VoidError,
+    list_void_records,
+    void_missing,
+    voided_count,
 )
 
 
@@ -98,9 +109,11 @@ def list_devices():
             """
             SELECT d.device_id,
                    d.committed_upto,
-                   (SELECT COUNT(*) FROM buffer    b WHERE b.device_id = d.device_id) AS buffered_count,
-                   (SELECT COUNT(*) FROM committed c WHERE c.device_id = d.device_id) AS committed_count,
-                   (SELECT COUNT(*) FROM duplicates p WHERE p.device_id = d.device_id) AS duplicate_count
+                   (SELECT COUNT(*) FROM buffer       b WHERE b.device_id = d.device_id) AS buffered_count,
+                   (SELECT COUNT(*) FROM committed    c WHERE c.device_id = d.device_id) AS committed_count,
+                   (SELECT COUNT(*) FROM duplicates   p WHERE p.device_id = d.device_id) AS duplicate_count,
+                   (SELECT COALESCE(SUM(v.to_seq - v.from_seq + 1), 0)
+                      FROM void_records v WHERE v.device_id = d.device_id) AS voided_count
             FROM devices d ORDER BY d.device_id
             """
         ).fetchall()
@@ -112,6 +125,7 @@ def list_devices():
             buffered_count=r["buffered_count"],
             committed_count=r["committed_count"],
             duplicate_count=r["duplicate_count"],
+            voided_count=r["voided_count"],
         )
         for r in rows
     ]
@@ -212,6 +226,75 @@ def get_duplicates(
         device_id=device_id,
         count=total,
         records=[DuplicateRecord(**dict(r)) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 缺包作废
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/devices/{device_id}/voids", response_model=VoidResponse)
+def post_void(
+    device_id: str,
+    void_in: VoidCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    """登记一段确定缺失的连续序号并立即排水。
+
+    仅允许对已有设备、从当前 next_expected 开始且段内确为缺口的连续序号
+    作废；段尾不得超过缓冲区最大序号，已提交 / 已缓冲 / 已作废序号均不可
+    作废。与摄入共用串行锁与事务，幂等键重试不产生重复登记或重复推进。
+    """
+    key = void_in.idempotency_key or idempotency_key
+    if not key:
+        raise HTTPException(
+            status_code=422,
+            detail="缺少幂等键：请在请求体 idempotency_key 或 Idempotency-Key 请求头中提供",
+        )
+    with db.ingest_lock, db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        try:
+            return void_missing(
+                conn, device_id, void_in.from_seq, void_in.to_seq, key
+            )
+        except VoidConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except VoidError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/devices/{device_id}/voids", response_model=VoidsResponse)
+def get_voids(
+    device_id: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    """按设备分页查询作废登记，按登记先后升序返回。"""
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT committed_upto FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        total, rows = list_void_records(conn, device_id, limit, offset)
+        voided_total = voided_count(conn, device_id)
+        upto = dev["committed_upto"]
+    records = []
+    for r in rows:
+        d = dict(r)
+        d["voided_seqs"] = list(range(r["from_seq"], r["to_seq"] + 1))
+        records.append(VoidRecordOut(**d))
+    return VoidsResponse(
+        device_id=device_id,
+        committed_upto=upto,
+        next_expected=upto + 1,
+        count=total,
+        voided_count=voided_total,
+        records=records,
     )
 
 
